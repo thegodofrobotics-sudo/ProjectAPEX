@@ -14,12 +14,17 @@ LiquidCrystal_I2C lcd(0x27, 16, 2); // Change address to 0x3F if 0x27 shows blan
 #define SERVO_PIN      6
 #define BUZZER_PIN     8
 
+// --- GSM (SIM900A) HARDWARE SERIAL 2 ---
+// SIM900A 5VT -> Arduino Mega Pin 17 (RX2)
+// SIM900A 5VR -> Arduino Mega Pin 16 (TX2)
+// SIM900A GND -> Arduino Mega GND (Common Ground)
+
 // --- GSM PARAMETERS ---
-const String TARGET_PHONE = "+1234567890";  // Replace with your target mobile number (with country code)
+const String TARGET_PHONE = "+1234567890";  // Replace with target mobile number with country code
 
 // --- SCANNED RFID UIDS & USER NAMES ---
-byte user1_UID[4] = {0x2C, 0x4A, 0x55, 0x4A}; // Person 1: ARNAV GUPTA (Enrolled as Fingerprint ID 1)
-byte user2_UID[4] = {0x33, 0x37, 0x1F, 0x17}; // Person 2: ADAMYA BHUSHAN (Enrolled as Fingerprint ID 2)
+byte user1_UID[4] = {0x2C, 0x4A, 0x55, 0x4A}; // Person 1: ARNAV GUPTA (Fingerprint IDs: 1, 2, 3, 4)
+byte user2_UID[4] = {0x33, 0x37, 0x1F, 0x17}; // Person 2: ADAMYA BHUSHAN (Fingerprint IDs: 5, 6, 7, 8)
 
 const String USER1_NAME = "ARNAV GUPTA";
 const String USER2_NAME = "ADAMYA BHUSHAN";
@@ -37,6 +42,7 @@ Servo gateServo;
 void updateLCDDefault();
 int checkRFID();
 int checkFingerprint();
+int getUserIdFromFingerprint(int fpID);
 void processAccess(int userId);
 void triggerUnauthorizedAlarm(String reason);
 void initGSM();
@@ -45,8 +51,8 @@ void makeCall();
 
 void setup() {
   Serial.begin(9600);   // USB Serial Monitor
-  Serial1.begin(57600); // Hardware Serial 1 (R307S Fingerprint)
-  Serial2.begin(9600);  // Hardware Serial 2 (SIM800L GSM)
+  Serial1.begin(57600); // Hardware Serial 1 (R307/R307S Fingerprint)
+  Serial2.begin(9600);  // Hardware Serial 2 (SIM900A GSM)
 
   // 1. Initialize LCD
   lcd.init();
@@ -65,23 +71,23 @@ void setup() {
   digitalWrite(BUZZER_PIN, LOW);
 
   gateServo.attach(SERVO_PIN);
-  gateServo.write(0); // Position gate locked (0 degrees)
+  gateServo.write(0); // Lock gate at initial position
 
   // 4. Verify Fingerprint Sensor Connection
   delay(1000);
   if (finger.verifyPassword()) {
     Serial.println("[SYSTEM] R307S Fingerprint Sensor Connected.");
   } else {
-    Serial.println("[ERROR] R307S Sensor Not Detected! Check TX/RX on Pins 18/19.");
+    Serial.println("[ERROR] R307S Sensor Not Detected! Check Mega Pins 18/19 and 5V/GND.");
   }
 
-  // 5. Initialize GSM Module
+  // 5. Initialize SIM900A GSM Module
   initGSM();
 
   Serial.println("==============================================");
   Serial.println(" ARDUINO MEGA SECURITY SYSTEM READY ");
-  Serial.println(" User 1: ARNAV GUPTA");
-  Serial.println(" User 2: ADAMYA BHUSHAN");
+  Serial.println(" User 1: ARNAV GUPTA    | Enrolled IDs: 1, 2, 3, 4");
+  Serial.println(" User 2: ADAMYA BHUSHAN | Enrolled IDs: 5, 6, 7, 8");
   Serial.println("==============================================");
 
   updateLCDDefault();
@@ -91,6 +97,21 @@ void loop() {
   // Check for an RFID Card Scan
   int authenticatedUser = checkRFID();
 
+  // Unauthorized / Invalid RFID Card scanned
+  if (authenticatedUser == -1) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("INVALID CARD!");
+    lcd.setCursor(0, 1);
+    lcd.print("UNAUTHORIZED!");
+    
+    Serial.println("[SECURITY BREACH] Unregistered RFID card scanned!");
+    triggerUnauthorizedAlarm("Unregistered RFID card scanned");
+    updateLCDDefault();
+    return;
+  }
+
+  // Valid RFID Card scanned -> Prompt for Fingerprint
   if (authenticatedUser > 0) {
     String currentName = (authenticatedUser == 1) ? USER1_NAME : USER2_NAME;
     
@@ -112,21 +133,52 @@ void loop() {
     bool fpMatched = false;
 
     while (millis() - startTime < 10000) {
-      int fpID = checkFingerprint();
+      int rawFpID = checkFingerprint();
       
-      if (fpID == authenticatedUser) {
-        fpMatched = true;
-        break;
-      } else if (fpID > 0 && fpID != authenticatedUser) {
-        // Fingerprint belonged to a different person than the scanned card
+      // Case 1: Fingerprint detected & verified in memory
+      if (rawFpID > 0) {
+        int matchedUser = getUserIdFromFingerprint(rawFpID);
+
+        if (matchedUser == authenticatedUser) {
+          fpMatched = true;
+          break; // Correct card + matching finger
+        } else if (matchedUser > 0 && matchedUser != authenticatedUser) {
+          // Card belongs to User A, but finger belongs to User B
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("ACCESS DENIED!");
+          lcd.setCursor(0, 1);
+          lcd.print("USER MISMATCH!");
+          
+          Serial.println("[ALERT] RFID and Fingerprint user mismatch!");
+          triggerUnauthorizedAlarm("RFID & Fingerprint User Mismatch");
+          updateLCDDefault();
+          return;
+        } else {
+          // Finger is enrolled in flash but not mapped to User 1 or 2
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("ACCESS DENIED!");
+          lcd.setCursor(0, 1);
+          lcd.print("UNMAPPED FINGER!");
+          
+          Serial.println("[ALERT] Fingerprint ID not in 1-8 range!");
+          triggerUnauthorizedAlarm("Unmapped Fingerprint Scanned");
+          updateLCDDefault();
+          return;
+        }
+      }
+      
+      // Case 2: Finger was placed, but NOT found in database (Intruder)
+      else if (rawFpID == -1) {
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("ACCESS DENIED!");
         lcd.setCursor(0, 1);
-        lcd.print("ID MISMATCH!");
+        lcd.print("UNKNOWN FINGER!");
         
-        Serial.println("[ALERT] RFID Card and Fingerprint ID mismatch!");
-        triggerUnauthorizedAlarm("RFID & Fingerprint ID Mismatch");
+        Serial.println("[ALERT] Unregistered fingerprint scanned!");
+        triggerUnauthorizedAlarm("Unregistered Fingerprint Scanned");
         updateLCDDefault();
         return;
       }
@@ -146,7 +198,16 @@ void loop() {
   }
 }
 
-// Update LCD to show system ready state and occupancy status
+// Maps 8 enrolled fingerprint slots across User 1 and User 2
+int getUserIdFromFingerprint(int fpID) {
+  if (fpID >= 1 && fpID <= 4) {
+    return 1; // Arnav Gupta (IDs 1, 2, 3, 4)
+  } else if (fpID >= 5 && fpID <= 8) {
+    return 2; // Adamya Bhushan (IDs 5, 6, 7, 8)
+  }
+  return 0; // Unrecognized slot ID
+}
+
 void updateLCDDefault() {
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -156,6 +217,7 @@ void updateLCDDefault() {
 }
 
 // Read RFID Card
+// Returns: 1 (User 1), 2 (User 2), -1 (Unauthorized card), 0 (No card present)
 int checkRFID() {
   if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
     return 0;
@@ -167,15 +229,7 @@ int checkRFID() {
   } else if (memcmp(rfid.uid.uidByte, user2_UID, 4) == 0) {
     user = 2;
   } else {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("INVALID CARD!");
-    lcd.setCursor(0, 1);
-    lcd.print("UNAUTHORIZED!");
-    
-    Serial.println("[SECURITY BREACH] Unregistered RFID card scanned!");
-    triggerUnauthorizedAlarm("Unregistered RFID card scanned");
-    updateLCDDefault();
+    user = -1; // Flagged as unauthorized card
   }
 
   rfid.PICC_HaltA();
@@ -183,27 +237,38 @@ int checkRFID() {
   return user;
 }
 
-// Read Fingerprint from R307S via Hardware Serial1
+// Optical Fingerprint check
+// Returns: ID (1-127 if matched), -1 (Finger placed but not recognized), 0 (No finger placed)
 int checkFingerprint() {
   uint8_t p = finger.getImage();
+  if (p == FINGERPRINT_NOFINGER) return 0;
   if (p != FINGERPRINT_OK) return 0;
 
   p = finger.image2Tz();
   if (p != FINGERPRINT_OK) return 0;
 
-  p = finger.fingerSearch();
+  p = finger.fingerFastSearch();
   if (p == FINGERPRINT_OK) {
-    return finger.fingerID; // Returns 1 or 2
+    Serial.print("[FP DETECTED] Matched Slot ID: #");
+    Serial.print(finger.fingerID);
+    Serial.print(" | Confidence Score: ");
+    Serial.println(finger.confidence);
+
+    if (finger.confidence >= 40) {
+      return finger.fingerID;
+    }
+  } else if (p == FINGERPRINT_NOTFOUND) {
+    return -1; // Finger detected but template not found in database
   }
+  
   return 0;
 }
 
-// Perform Gate Opening and SMS Sequence
 void processAccess(int userId) {
   // 1. Open Servo Gate
   gateServo.write(90);
 
-  // 2. Toggle state & format alert text
+  // 2. Toggle occupancy state & format notification text
   String msg = "";
   String shortName = "";
   bool isInside = false;
@@ -220,7 +285,7 @@ void processAccess(int userId) {
     msg = "ADAMYA BHUSHAN is " + String(adamya_Inside ? "INSIDE" : "OUTSIDE");
   }
 
-  // Display status on LCD
+  // 3. Display status on LCD
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("ACCESS GRANTED!");
@@ -230,54 +295,68 @@ void processAccess(int userId) {
   Serial.println("[SMS NOTIFICATION]: " + msg);
   sendSMS(msg);
 
-  // Delay for user passage (5 seconds)
+  // Allow passage time (5 seconds)
   delay(5000);
 
-  // 3. Lock Servo Gate
+  // 4. Lock Servo Gate
   gateServo.write(0);
   delay(1000);
 
   updateLCDDefault();
 }
 
-// Alarm & GSM Alert Function
+// Alarm & GSM Alert Function (Handles Buzzer, SMS, and Call)
 void triggerUnauthorizedAlarm(String reason) {
   digitalWrite(BUZZER_PIN, HIGH);
 
   Serial.println("[ALARM TRIGGERED]: " + reason);
   
+  // Send SMS Alert
   sendSMS("SECURITY ALERT: " + reason);
+  
+  // Make Phone Call Alert
   makeCall();
 
   delay(5000);
   digitalWrite(BUZZER_PIN, LOW);
 }
 
-// GSM Commands
 void initGSM() {
-  Serial2.println("AT");
-  delay(1000);
-  Serial2.println("AT+CMGF=1"); // Set SMS to Text Mode
-  delay(1000);
+  Serial.println("[GSM] Initializing SIM900A Module...");
+  
+  for (int i = 0; i < 4; i++) {
+    Serial2.println("AT");
+    delay(500);
+  }
+
+  Serial2.println("ATE0");              // Turn off local echo
+  delay(500);
+  Serial2.println("AT+CMGF=1");         // Set SMS text mode
+  delay(500);
+  Serial2.println("AT+CNMI=2,2,0,0,0"); // Direct SMS routing to UART
+  delay(500);
+
+  Serial.println("[GSM] SIM900A Ready.");
 }
 
 void sendSMS(String text) {
   Serial2.println("AT+CMGF=1");
-  delay(500);
+  delay(300);
   Serial2.print("AT+CMGS=\"");
   Serial2.print(TARGET_PHONE);
   Serial2.println("\"");
   delay(500);
   Serial2.print(text);
   delay(500);
-  Serial2.write(26); // ASCII 26 (CTRL+Z) to send SMS
-  delay(3000);
+  Serial2.write(26); // ASCII 26 (CTRL+Z) sends SMS
+  delay(4000);       // Wait for SIM900A transmission ACK
 }
 
 void makeCall() {
   Serial2.print("ATD");
   Serial2.print(TARGET_PHONE);
   Serial2.println(";");
-  delay(10000); // Ring for 10 seconds
-  Serial2.println("ATH"); // Hang up line
+  delay(10000); // Ring target for 10 seconds
+  Serial2.println("ATH"); // Disconnect call
+  delay(500);
 }
